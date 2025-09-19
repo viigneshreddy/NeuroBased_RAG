@@ -1,1 +1,16 @@
-streamlit
+# --- Core ---
+streamlit==1.49.1
+numpy
+pandas
+
+# --- Hugging Face + RAG ---
+transformers>=4.44.2
+accelerate
+sentence-transformers
+rank-bm25
+safetensors
+huggingface_hub
+hf_transfer
+
+# --- PyTorch (CPU wheel compatible with py3.11 on Streamlit Cloud) ---
+torch==2.2.2
