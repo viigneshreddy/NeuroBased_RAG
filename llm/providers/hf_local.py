@@ -1,59 +1,147 @@
 # llm/providers/hf_local.py
-from transformers import AutoTokenizer, AutoModelForCausalLM
+# Lightweight Hugging Face LLM wrapper for local/Streamlit Cloud usage.
+
+from __future__ import annotations
+
+import os
+from typing import Tuple, Optional
+
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-_DEFAULT_MODEL = "microsoft/Phi-3-mini-4k-instruct"
-_ATTENTION_IMPL = "eager"     # Mac-friendly (no flash-attn)
-_TRUST_REMOTE_CODE = False     # Safer default
-_REVISION = None               # Optional: pin a specific commit SHA
 
-_tokenizer = None
-_model = None
+# ----------------------------
+# Configuration (tweak here)
+# ----------------------------
+# Small, deploy-friendly default model. You can switch to Qwen/Qwen2.5-3B-Instruct if you have more RAM.
+_DEFAULT_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
-def _pick_device_and_dtype():
-    if torch.backends.mps.is_available():           # Apple Silicon GPU
-        return {"device_map": {"": "mps"}, "dtype": torch.float16}
-    elif torch.cuda.is_available():                 # NVIDIA GPU
-        return {"device_map": "auto", "dtype": torch.bfloat16}
-    else:                                           # CPU
-        return {"device_map": "cpu", "dtype": torch.float32}
+# Safe attention backend (no flash-attention requirements).
+_ATTENTION_IMPL = "eager"
 
+# For safety, avoid remote code unless the model explicitly requires it.
+_TRUST_REMOTE_CODE = False
+
+# Pin a specific commit for reproducibility (optional). Example: "a1b2c3d4e5..."
+_REVISION: Optional[str] = None
+
+# Read optional Hugging Face token from env (useful on Streamlit Cloud → App secrets).
+_HF_TOKEN: Optional[str] = os.getenv("HF_TOKEN")
+
+
+# ---------------------------------
+# Optional Streamlit resource cache
+# ---------------------------------
+def _identity(x):
+    return x
+
+try:
+    import streamlit as st
+    cache_resource = st.cache_resource  # persists across reruns on Streamlit Cloud
+except Exception:
+    cache_resource = _identity  # no-op fallback when not in Streamlit
+
+
+# ----------------------------
+# Device & dtype selection
+# ----------------------------
+def _pick_device_and_dtype() -> Tuple[dict, torch.dtype]:
+    """
+    Chooses a device map and dtype based on availability.
+    - Apple Silicon: MPS + float16
+    - CUDA: auto + bfloat16
+    - CPU: cpu + float32
+    """
+    if torch.backends.mps.is_available():
+        return {"device_map": {"": "mps"}}, torch.float16
+    if torch.cuda.is_available():
+        return {"device_map": "auto"}, torch.bfloat16
+    return {"device_map": "cpu"}, torch.float32
+
+
+# ----------------------------
+# Lazy, cached loader
+# ----------------------------
+@cache_resource
 def _load(model_name: str = _DEFAULT_MODEL):
-    global _tokenizer, _model
-    if _tokenizer is not None and _model is not None:
-        return _tokenizer, _model
+    """
+    Loads and returns (tokenizer, model). Cached so it only loads once per session.
+    """
+    device_map_cfg, dtype = _pick_device_and_dtype()
 
-    cfg = _pick_device_and_dtype()
-    _tokenizer = AutoTokenizer.from_pretrained(
-        model_name, revision=_REVISION, trust_remote_code=_TRUST_REMOTE_CODE
-    )
-    if _tokenizer.pad_token_id is None:
-        _tokenizer.pad_token = _tokenizer.eos_token
-
-    _model = AutoModelForCausalLM.from_pretrained(
+    tok = AutoTokenizer.from_pretrained(
         model_name,
-        dtype=cfg["dtype"],                 # <- use dtype (not torch_dtype)
-        device_map=cfg["device_map"],
-        attn_implementation=_ATTENTION_IMPL,
-        low_cpu_mem_usage=True,
         revision=_REVISION,
         trust_remote_code=_TRUST_REMOTE_CODE,
+        token=_HF_TOKEN,
     )
-    # If you still hit a cache mismatch, uncomment:
-    # _model.config.use_cache = False
-    return _tokenizer, _model
+    # Ensure pad token exists for generation
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
 
-def generate(prompt: str, max_new_tokens: int = 220, temperature: float = 0.4, model_name: str = _DEFAULT_MODEL) -> str:
+    mdl = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        revision=_REVISION,
+        trust_remote_code=_TRUST_REMOTE_CODE,
+        low_cpu_mem_usage=True,
+        attn_implementation=_ATTENTION_IMPL,
+        dtype=dtype,                 # Use `dtype=` (newer Transformers) instead of torch_dtype
+        device_map=device_map_cfg["device_map"],
+        token=_HF_TOKEN,
+    )
+
+    # If you hit cache API mismatches with some models, uncomment:
+    # mdl.config.use_cache = False
+
+    return tok, mdl
+
+
+# ----------------------------
+# Text generation API
+# ----------------------------
+def generate(
+    prompt: str,
+    max_new_tokens: int = 220,
+    temperature: float = 0.4,
+    top_p: float = 0.95,
+    repetition_penalty: float = 1.05,
+    model_name: str = _DEFAULT_MODEL,
+) -> str:
+    """
+    Simple text generation interface.
+    """
     tok, mdl = _load(model_name)
-    inputs = tok(prompt, return_tensors="pt").to(mdl.device)
-    output = mdl.generate(
+
+    inputs = tok(prompt, return_tensors="pt")
+    # Send tensors to the model's device
+    inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
+
+    output_ids = mdl.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        do_sample=temperature > 0,
+        do_sample=(temperature > 0),
         temperature=temperature,
-        repetition_penalty=1.05,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
         eos_token_id=tok.eos_token_id,
         pad_token_id=tok.eos_token_id,
-        # use_cache=False,  # <- enable if you still hit the DynamicCache/seen_tokens error
+        # use_cache=False,  # uncomment if you hit cache-related errors on some models
     )
-    return tok.decode(output[0], skip_special_tokens=True)
+
+    text = tok.decode(output_ids[0], skip_special_tokens=True)
+    return text
+
+
+# ----------------------------
+# Optional: deterministic runs
+# ----------------------------
+def set_seed(seed: int = 42):
+    """
+    Set a global seed for reproducibility (best-effort).
+    """
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        # MPS doesn't support full determinism yet, but we still set the CPU seed.
+        pass
